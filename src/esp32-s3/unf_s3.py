@@ -15,14 +15,15 @@ from bluetooth import BLE
 import ujson
 
 from lib.sensors.hx711_driver import HX711
-from payload import advertising_payload
+from lib.payload import advertising_payload
 from s3_const import *
 import s3_const as CFG
-from gatt_defs import WEIGHT_SERVICE_UUID, WEIGHT_SERVICE, GATT_SCHEMA_VERSION
-from power_manager import PowerManager          # Tracks "no load" / idle state
-from low_power_scale import LowPowerScale       # New wrapper around HX711 + PowerManager
+from lib.gatt_defs import WEIGHT_SERVICE_UUID, WEIGHT_SERVICE, GATT_SCHEMA_VERSION
+from lib.power_manager import PowerManager          # Tracks "no load" / idle state
+from lib.low_power_scale import LowPowerScale       # New wrapper around HX711 + PowerManager
 
 from lib.s3_neopixel_led_manager import S3RGBManager
+
 from lib.common_const import (
     IRQ_CENTRAL_CONNECT,
     IRQ_CENTRAL_DISCONNECT,
@@ -85,10 +86,15 @@ class BLEScale:
     def init_sensors(self):
         # HX711 load cell amplifier.
         # You should calibrate SCALE so that hx.get_units() returns grams.
+        #self.hx = HX711(CFG.DT_PIN, CFG.SCK_PIN)
+        #self.hx.set_scale(2280)   # calibration factor
+        #self.offset = 0
+        #self.hx.tare()
+        
         self.hx = HX711(CFG.DT_PIN, CFG.SCK_PIN)
-        self.hx.set_scale(2280)   # calibration factor
-        self.offset = 0
+        self.hx.set_scale(CFG.HX711_SCALE)  # <-- same as in test script
         self.hx.tare()
+        
 
         # ─────────────────────────────────────────────────────────────
         # Power manager + HX711 + LowPowerScale
@@ -341,13 +347,27 @@ class BLEScale:
         except Exception as e:
             print("Failed to send response:", e)
 
-    def reply_tx(self, attr):
+    def reply_tx_1(self, attr):
         """
         Backward-compatible TX handler used by the READ IRQ.
 
         Simply delegates to send_tx_as_json_response(), so all JSON
         formatting lives in a single place.
         """
+        self.send_tx_as_json_response(attr)
+        
+    def reply_tx(self, attr):
+        """
+        TX handler used by the READ IRQ.
+
+        IMPORTANT:
+        - Take a fresh weight reading before sending.
+        - This makes the scale work even if run() is never called.
+        """
+        # 1. Update weight_tx with a fresh measurement
+        self.check_scale()
+
+        # 2. Build and send the JSON response
         self.send_tx_as_json_response(attr)
 
     # ─────────────────────────────────────────────────────────────────
@@ -378,7 +398,7 @@ class BLEScale:
     # ─────────────────────────────────────────────────────────────────
     # Weight reading + power-optimized HX711 usage via LowPowerScale
     # ─────────────────────────────────────────────────────────────────
-    def get_weight(self):
+    def get_weight_1(self):
         """
         Read weight using LowPowerScale.
 
@@ -400,11 +420,73 @@ class BLEScale:
                 weight_g = self.scale.read_weight_normal(times=3)
 
             self.last_weight_g = weight_g
-            weight_kg = weight_g / 1000.0
+            #weight_kg = weight_g / 1000.0
+            weight_kg = self.last_weight_g / 1000.0
             return weight_kg
 
         except Exception as e:
             print("HX711 error:", e)
+            return 0.0
+    def get_weight(self):
+        """
+        Read weight using LowPowerScale.
+
+        Internally:
+        - LowPowerScale always works in grams (HX711 calibrated accordingly).
+        - PowerManager.update_with_weight() is called inside LowPowerScale.
+        - HX711 is powered down when idle (inside LowPowerScale low-power mode).
+
+        Externally:
+        - Returns kilograms.
+        - Also keeps weight_tx in sync.
+        """
+        try:
+            if self.pm.idle:
+                weight_g = self.scale.read_weight_low_power(
+                    times=1,
+                    idle_sleep_ms=0,  # no internal sleep; run() controls loop timing
+                )
+            else:
+                weight_g = self.scale.read_weight_normal(times=3)
+
+            self.last_weight_g = weight_g
+            weight_kg = weight_g / 1000.0
+
+            # Keep the TX field always up to date
+            self.weight_tx = weight_kg
+
+            return weight_kg
+
+        except Exception as e:
+            print("HX711 error:", e)
+            self.weight_tx = 0.0
+            return 0.0
+
+
+    #working fine - method for testing 
+    def get_weight_for_testing(self):
+        """
+        Minimal version that behaves like the working test loop:
+        - Always use read_weight_low_power(times=1, idle_sleep_ms=0)
+        - Return kilograms
+        - Keep weight_tx in sync
+        """
+        try:
+            # Use the same logic as your test: always low-power read, no branch on pm.idle
+            weight_g = self.scale.read_weight_low_power(
+                times=1,
+                idle_sleep_ms=0
+            )
+
+            self.last_weight_g = weight_g
+            weight_kg = weight_g / 1000.0
+
+            self.weight_tx = weight_kg
+            return weight_kg
+
+        except Exception as e:
+            print("HX711 error:", e)
+            self.weight_tx = 0.0
             return 0.0
 
     def check_scale(self):
